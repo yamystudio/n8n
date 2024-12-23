@@ -85,15 +85,28 @@ steps:
           
           gsutil cp /workspace/$${BACKUP_PREFIX}_db.sql gs://${_BACKUP_BUCKET}/database/
           gsutil cp /workspace/$${BACKUP_PREFIX}_pv.tar.gz gs://${_BACKUP_BUCKET}/persistent_volume/
-          
-          echo "Creating GKE backup..."
-          gcloud container backup-restore backup-plans create $${BACKUP_PREFIX} \
-            --project=${PROJECT_ID} \
-            --location=${_CLUSTER_LOCATION} \
-            --cluster=${_CLUSTER_NAME} \
-            --include-namespaces=${_NAMESPACE} \
-            --include-volume-data \
-            --retain-days=30
+
+          gcloud components install beta --quiet
+
+          echo "Checking if GKE backup plan exists..."
+          if ! gcloud beta container backup-restore backup-plans describe n8n-backup-plan \
+              --project=${PROJECT_ID} \
+              --location=${_CLUSTER_LOCATION} > /dev/null 2>&1; then
+              echo "Backup plan does not exist, creating..."
+              gcloud beta container backup-restore backup-plans create n8n-backup-plan \
+                  --project=${PROJECT_ID} \
+                  --location=${_CLUSTER_LOCATION} \
+                  --cluster=projects/${PROJECT_ID}/locations/${_CLUSTER_LOCATION}/clusters/${_CLUSTER_NAME} \
+                  --selected-namespaces=${_NAMESPACE} \
+                  --backup-retain-days=7 --quiet
+          else
+              echo "Backup plan already exists, proceeding with backup creation..."
+          fi
+
+          gcloud beta container backup-restore backups create n8n-backup-$(date +%Y%m%d-%H%M%S) \
+              --project=${PROJECT_ID} \
+              --location=${_CLUSTER_LOCATION} \
+              --backup-plan=n8n-backup-plan --quiet
           
           echo "All backups completed successfully."
         else
@@ -148,14 +161,15 @@ steps:
         fi
 
 substitutions:
-  _CLUSTER_LOCATION: '' # e.g. europe-west1 - Required
-  _CLUSTER_NAME: '' # e.g. n8n-cluster - Required
-  _DEPLOYMENT_NAME: '' # e.g. n8n - Required
-  _NAMESPACE: '' # e.g. n8n - Required
-  _PG_SECRET_NAME: '' # e.g. postgres-secret - Required
-  _BACKUP_BUCKET: '' # e.g. backup-gcs - Required
-  _REPO_LOCATION: '' # e.g. europe-west1 - Required
-  _TARGET_N8N_VERSION: '' # Optional: specify target version
+  _CLUSTER_LOCATION: ''
+  _CLUSTER_NAME: ''
+  _DEPLOYMENT_NAME: ''
+  _NAMESPACE: ''
+  _PG_SECRET_NAME: ''
+  _BACKUP_BUCKET: ''
+  _REPO_LOCATION: ''
+  _TARGET_N8N_VERSION: ''
+  _AUTO_UPGRADE: ''
 
 options:
   dynamicSubstitutions: true

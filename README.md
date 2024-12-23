@@ -46,14 +46,15 @@ gcloud builds submit --config=cloudbuild.yaml \
 Configuration variables:
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `_CLUSTER_LOCATION` | Kubernetes Cluster Location | `europe-west1` |
-| `_CLUSTER_NAME` | Kubernetes Cluster Name | `n8n-cluster` |
-| `_DEPLOYMENT_NAME` | N8N Deployment Name | `n8n` |
-| `_NAMESPACE` | Kubernetes Namespace | `n8n` |
-| `_PG_SECRET_NAME` | PostgreSQL Secret Name | `postgres-secret` |
-| `_BACKUP_BUCKET` | GCS Bucket for Backups | `backup-gcs` |
-| `_REPO_LOCATION` | Artifact Registry Location | `europe-west1` |
-| `_TARGET_N8N_VERSION` | Optional: Specific N8N Version | `1.69.1` |
+| `_CLUSTER_LOCATION` | GKE cluster location (must specify region or zone based on cluster type) | Region: `europe-west1`<br>Zone: `europe-west1-b` |
+| `_CLUSTER_NAME` | Name of the GKE cluster | `n8n-cluster` |
+| `_DEPLOYMENT_NAME` | Name of the N8N deployment | `n8n` |
+| `_NAMESPACE` | Kubernetes namespace | `n8n` |
+| `_PG_SECRET_NAME` | PostgreSQL secret name | `postgres-secret` |
+| `_BACKUP_BUCKET` | GCS bucket for backups | `backup-gcs` |
+| `_REPO_LOCATION` | Artifact Registry location | `europe-west1` |
+| `_TARGET_N8N_VERSION` | Specific N8N version (optional) | `1.69.1` |
+| `_AUTO_UPGRADE` | Set to `true` for automatic upgrades; leave empty for manual upgrades | `true` |
 
 #### Option B: Automated Upgrades
 For automated upgrades, you'll need to:
@@ -84,9 +85,10 @@ gcloud builds triggers create manual \
 
 2. Set up Cloud Scheduler job:
 ```bash
-# Get your project ID and trigger ID
+# Get your project ID, Number and trigger ID
 PROJECT_ID=$(gcloud config get-value project)
 TRIGGER_ID=$(gcloud builds triggers describe n8n-auto-upgrade --format='value(id)')
+PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)')
 
 # Create service account for Cloud Scheduler
 gcloud iam service-accounts create n8n-upgrade-scheduler \
@@ -103,6 +105,10 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
   --member="serviceAccount:${SERVICE_ACCOUNT}" \
   --role="roles/cloudbuild.builds.approver"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member=serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com \
+    --role=roles/gkebackup.admin
 
 # Create the scheduler job
 gcloud scheduler jobs create http n8n-version-check \
