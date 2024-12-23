@@ -1,7 +1,7 @@
 ARG NODE_VERSION=18
 FROM n8nio/base:${NODE_VERSION}
 
-ARG N8N_VERSION=1.27.2
+ARG N8N_VERSION=1.27.1
 RUN if [ -z "$N8N_VERSION" ] ; then echo "The N8N_VERSION argument is missing!" ; exit 1; fi
 
 ENV N8N_VERSION=${N8N_VERSION}
@@ -19,24 +19,23 @@ RUN set -eux; \
 COPY docker-entrypoint.sh /
 RUN chmod 777 /docker-entrypoint.sh
 
-# Install base
 RUN apk update && apk add curl python3 bash su-exec
 
-# Downloading gcloud package
 RUN curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz
 
-# Installing the package
 RUN mkdir -p /usr/local/gcloud \
   && tar -C /usr/local/gcloud -xvf /tmp/google-cloud-sdk.tar.gz \
   && /usr/local/gcloud/google-cloud-sdk/install.sh \
   && rm -rf /tmp/google-cloud-sdk.tar.gz
 
-# Adding the package path to local
-ENV PATH $PATH:/usr/local/gcloud/google-cloud-sdk/bin
+ENV PATH=$PATH:/usr/local/gcloud/google-cloud-sdk/bin
 
-RUN \
-	mkdir .n8n && \
-	chown node:node .n8n
+RUN mkdir .n8n && \
+    chown node:node .n8n && \
+    chmod 700 .n8n
 USER root
+
+ENV N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+ENV N8N_SECURE_COOKIE=false
 
 ENTRYPOINT ["tini", "--", "/docker-entrypoint.sh"]

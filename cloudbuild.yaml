@@ -1,0 +1,161 @@
+steps:
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - container
+      - clusters
+      - get-credentials
+      - ${_CLUSTER_NAME}
+      - --region=${_CLUSTER_LOCATION}
+      - --project=${PROJECT_ID}
+
+  - name: 'gcr.io/cloud-builders/kubectl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        CURRENT_VERSION=$$(kubectl get deployment ${_DEPLOYMENT_NAME} -n ${_NAMESPACE} \
+          -o jsonpath='{.spec.template.spec.containers[0].image}' | awk -F: '{print $$2}')
+        if [ -z "$$CURRENT_VERSION" ]; then
+          echo "Error: Could not determine current version"
+          exit 1
+        fi
+        echo "Current version: $$CURRENT_VERSION"
+        echo "$$CURRENT_VERSION" > /workspace/current_version
+
+        if [ "${_AUTO_UPGRADE}" = "true" ] ||[ -z "${_TARGET_N8N_VERSION}" ]; then
+          echo "No target version specified or auto upgrade enabled, getting latest..."
+          TARGET_VERSION=$$(curl -s https://api.github.com/repos/n8n-io/n8n/releases | \
+            grep -m 1 '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
+        else
+          TARGET_VERSION="${_TARGET_N8N_VERSION}"
+        fi
+        
+        # Remove n8n@ prefix if exists
+        TARGET_VERSION=$$(echo "$$TARGET_VERSION" | sed 's/n8n@//')
+        
+        echo "Target version: $$TARGET_VERSION"
+        echo "$$TARGET_VERSION" > /workspace/target_version
+
+        if [ "$$CURRENT_VERSION" != "$$TARGET_VERSION" ]; then
+          echo "Upgrade needed from $$CURRENT_VERSION to $$TARGET_VERSION"
+          echo "true" > /workspace/upgrade_needed
+        else
+          echo "Already at version $$TARGET_VERSION"
+          echo "false" > /workspace/upgrade_needed
+        fi
+
+  - name: 'gcr.io/cloud-builders/kubectl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$$(cat /workspace/upgrade_needed)" = "true" ]; then
+          TIMESTAMP=$$(date +%Y%m%d_%H%M%S)
+          CURRENT_VERSION=$$(cat /workspace/current_version)
+          TARGET_VERSION=$$(cat /workspace/target_version)
+          BACKUP_PREFIX="n8n_$${CURRENT_VERSION}_to_$${TARGET_VERSION}_$${TIMESTAMP}"
+          
+          echo "Finding PostgreSQL pod..."
+          PG_POD=$$(kubectl get pods -n ${_NAMESPACE} | grep '^postgres-' | awk '{print $$1}')
+          if [ -z "$$PG_POD" ]; then
+            echo "Error: PostgreSQL pod not found"
+            exit 1
+          fi
+          echo "Found PostgreSQL pod: $$PG_POD"
+          
+          echo "Finding N8N pod..."
+          N8N_POD=$$(kubectl get pods -n ${_NAMESPACE} -l service=n8n -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$$N8N_POD" ]; then
+            echo "Error: N8N pod not found"
+            exit 1
+          fi
+          echo "Found N8N pod: $$N8N_POD"
+          
+          echo "Getting database credentials..."
+          DB_USER=$$(kubectl get secret ${_PG_SECRET_NAME} -n ${_NAMESPACE} -o jsonpath='{.data.POSTGRES_USER}' | tr -d '\n' | base64 -d)
+          DB_NAME=$$(kubectl get secret ${_PG_SECRET_NAME} -n ${_NAMESPACE} -o jsonpath='{.data.POSTGRES_DB}' | tr -d '\n' | base64 -d)
+          
+          echo "Using database: $$DB_NAME with user: $$DB_USER"
+          
+          echo "Creating database backup..."
+          kubectl exec $$PG_POD -n ${_NAMESPACE} -- pg_dump -U $$DB_USER $$DB_NAME > /workspace/$${BACKUP_PREFIX}_db.sql
+          
+          echo "Creating PV backup..."
+          kubectl exec $$N8N_POD -n ${_NAMESPACE} -- tar czf - /home/node/.n8n > /workspace/$${BACKUP_PREFIX}_pv.tar.gz
+          
+          gsutil cp /workspace/$${BACKUP_PREFIX}_db.sql gs://${_BACKUP_BUCKET}/database/
+          gsutil cp /workspace/$${BACKUP_PREFIX}_pv.tar.gz gs://${_BACKUP_BUCKET}/persistent_volume/
+          
+          echo "Creating GKE backup..."
+          gcloud container backup-restore backup-plans create $${BACKUP_PREFIX} \
+            --project=${PROJECT_ID} \
+            --location=${_CLUSTER_LOCATION} \
+            --cluster=${_CLUSTER_NAME} \
+            --include-namespaces=${_NAMESPACE} \
+            --include-volume-data \
+            --retain-days=30
+          
+          echo "All backups completed successfully."
+        else
+          echo "No upgrade needed, skipping backup"
+        fi
+
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        apt-get install jq -y
+        if [ "$$(cat /workspace/upgrade_needed)" = "true" ]; then
+          TARGET_VERSION=$$(cat /workspace/target_version)
+          
+          echo "Checking Node.js version requirement..."
+          NODE_VERSION=$$(
+            curl -s "https://api.github.com/repos/n8n-io/n8n/contents/package.json?ref=n8n@$$TARGET_VERSION" | jq -r '.content' | base64 -d | grep -oE '"node": *">=([0-9.]+)"' | sed -E 's/.*">=([0-9.]+)".*/\1/'
+          )
+          echo "Required Node.js version: $$NODE_VERSION"
+          
+          echo "Updating Dockerfile..."
+          sed -i "s/^ENV N8N_VERSION=.*/ENV N8N_VERSION=$$TARGET_VERSION/" Dockerfile
+          sed -i "s/^ENV NODE_VERSION=.*/ENV NODE_VERSION=$$NODE_VERSION/" Dockerfile
+          
+          echo "Building new image..."
+          docker build -t ${_REPO_LOCATION}-docker.pkg.dev/${PROJECT_ID}/n8n/n8n:$$TARGET_VERSION .
+          
+          echo "Pushing image..."
+          docker push ${_REPO_LOCATION}-docker.pkg.dev/${PROJECT_ID}/n8n/n8n:$$TARGET_VERSION
+        else
+          echo "No Dockerfile update or build needed"
+        fi
+
+  - name: 'gcr.io/cloud-builders/kubectl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$$(cat /workspace/upgrade_needed)" = "true" ]; then
+          TARGET_VERSION=$$(cat /workspace/target_version)
+          echo "Updating deployment to version $$TARGET_VERSION..."
+          
+          kubectl set image deployment/${_DEPLOYMENT_NAME} \
+            n8n=${_REPO_LOCATION}-docker.pkg.dev/${PROJECT_ID}/n8n/n8n:$$TARGET_VERSION \
+            -n ${_NAMESPACE}
+          
+          echo "Waiting for rollout to complete..."
+          kubectl rollout status deployment/${_DEPLOYMENT_NAME} -n ${_NAMESPACE} --timeout=300s
+        else
+          echo "No deployment update needed"
+        fi
+
+substitutions:
+  _CLUSTER_LOCATION: '' # e.g. europe-west1 - Required
+  _CLUSTER_NAME: '' # e.g. n8n-cluster - Required
+  _DEPLOYMENT_NAME: '' # e.g. n8n - Required
+  _NAMESPACE: '' # e.g. n8n - Required
+  _PG_SECRET_NAME: '' # e.g. postgres-secret - Required
+  _BACKUP_BUCKET: '' # e.g. backup-gcs - Required
+  _REPO_LOCATION: '' # e.g. europe-west1 - Required
+  _TARGET_N8N_VERSION: '' # Optional: specify target version
+
+options:
+  dynamicSubstitutions: true
